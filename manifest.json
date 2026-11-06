@@ -1,0 +1,25 @@
+{
+    "manifest_version":  3,
+    "name":  "Huya Mini Player",
+    "version":  "0.2.24",
+    "description":  "Huya mini player with customizable danmu settings and source-video recovery.",
+    "host_permissions":  [
+                             "https://www.huya.com/*",
+                             "https://*.huya.com/*"
+                         ],
+    "content_scripts":  [
+                            {
+                                "matches":  [
+                                                "https://www.huya.com/*",
+                                                "https://*.huya.com/*"
+                                            ],
+                                "js":  [
+                                           "content.js"
+                                       ],
+                                "run_at":  "document_idle"
+                            }
+                        ],
+    "action":  {
+                   "default_title":  "Huya Mini Player"
+               }
+}
