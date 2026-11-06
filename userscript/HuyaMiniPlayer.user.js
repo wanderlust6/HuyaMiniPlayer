@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Huya Mini Player
 // @namespace    https://www.huya.com/
-// @version      0.2.24
+// @version      0.3.0
 // @description  虎牙直播 Canvas 小窗与弹幕叠加，支持设置和视频源恢复
 // @match        https://www.huya.com/*
 // @match        https://*.huya.com/*
@@ -11,7 +11,19 @@
 // ==/UserScript==
 (() => {
 'use strict';
-if (window.__HUYA_MINI_PLAYER__) return;
+const existingRoots = [...document.querySelectorAll('#hmp-root')];
+if (window.__HUYA_MINI_PLAYER__) {
+  if (existingRoots.length > 1) {
+    const rank = el => {
+      const label = el.querySelector('#hmp-canvas-pip')?.textContent || '';
+      return label.includes('小窗播放') || label.includes('关闭小窗') ? 2 : label.includes('重试准备') ? 1 : 0;
+    };
+    const keep = existingRoots.reduce((best, el) => !best || rank(el) > rank(best) ? el : best, null);
+    existingRoots.forEach(el => { if (el !== keep) el.remove(); });
+  }
+  return;
+}
+existingRoots.forEach(el => el.remove());
 window.__HUYA_MINI_PLAYER__ = true;
 
 const state = {
@@ -20,7 +32,7 @@ const state = {
   chatNodeText: new WeakMap(), pendingChatNodes: new Set(), chatFlushTimer: 0,
   danmuQueue: [], danmuReceivedCount: 0, danmuDroppedCount: 0, danmuActiveCount: 0,
   canvas: null, canvasVideo: null, canvasStream: null, raf: 0,
-  sourceVideo: null, videoFrameCallbackId: 0,
+  sourceVideo: null, videoFrameCallbackId: 0, pipFrameCallbackId: 0,
   prepareAttempt: 0
 };
 
@@ -32,7 +44,9 @@ function logPrepare(attempt, startedAt, trigger, stage, detail = {}) {
   });
 }
 
+document.querySelectorAll('#hmp-style').forEach(el => el.remove());
 const style = document.createElement('style');
+style.id = 'hmp-style';
 style.textContent = '#hmp-root{position:fixed;right:18px;bottom:90px;z-index:2147483647;display:flex;gap:8px;align-items:center;font:14px system-ui;color:white}' +
   '#hmp-canvas-pip,#hmp-settings-toggle{background:rgba(23,25,29,.94);color:#fff;border:1px solid rgba(255,255,255,.55);border-radius:22px;padding:10px 17px;cursor:pointer;font:600 14px system-ui;box-shadow:0 2px 12px rgba(0,0,0,.35);transition:background .15s,border-color .15s}' +
   '#hmp-canvas-pip:hover:not(:disabled),#hmp-settings-toggle:hover{background:#30343b;border-color:#fff}' +
@@ -60,6 +74,8 @@ root.innerHTML = '<button class="hmp-btn" id="hmp-canvas-pip" disabled>正在准
     '<div class="hmp-setting-actions"><span id="hmp-settings-hint">设置自动保存</span><button id="hmp-save-words" type="button">保存屏蔽词</button></div>' +
   '</section>';
 document.documentElement.appendChild(root);
+root.style.display = 'none';
+
 const $ = q => root.querySelector(q);
 function status(t) {
   const button = $('#hmp-canvas-pip');
@@ -85,9 +101,18 @@ function scan() {
   ].join('\n') };
 }
 
+// 小窗宿主 video（#hmp-canvas-video）播放的是本脚本自己绘制的 Canvas 捕获流。
+// 它同样是一个 playing、有 videoWidth 的 <video>，如果被选为输入源就会形成自我捕获的
+// 反馈回路：每帧都把上一帧的合成画面（已经带有弹幕文字）重新画回 Canvas，
+// 表现为小窗视频像停在一帧、弹幕文字拖影/重影/条纹残影，且刷新页面后才恢复。
+function isOwnCanvasVideo(v) {
+  return !!v && (v === state.canvasVideo || v.id === 'hmp-canvas-video');
+}
+
 function chooseSource() {
   const { videos, report } = scan();
   const candidates = videos.filter(v =>
+    !isOwnCanvasVideo(v) &&
     v.videoWidth > 0 && v.videoHeight > 0 &&
     !v.disablePictureInPicture &&
     typeof v.requestPictureInPicture === 'function'
@@ -105,6 +130,8 @@ function chooseSource() {
 // 原生 PiP 入口已收敛到 Canvas 小窗按钮，不再单独显示。
 
 function stopCanvas() {
+  // 注意：这里不能隐藏 #hmp-root。stopCanvas 会在准备开始、绘制异常和 pagehide 时被调用，
+  // 一旦隐藏，失败/重试路径就没有任何可点击的入口，按钮看起来像“脚本没反应”。
   if (state.raf) cancelAnimationFrame(state.raf);
   state.raf = 0;
   if (state.sourceVideo && state.videoFrameCallbackId &&
@@ -112,6 +139,11 @@ function stopCanvas() {
     state.sourceVideo.cancelVideoFrameCallback(state.videoFrameCallbackId);
   }
   state.videoFrameCallbackId = 0;
+  if (state.canvasVideo && state.pipFrameCallbackId &&
+      typeof state.canvasVideo.cancelVideoFrameCallback === 'function') {
+    state.canvasVideo.cancelVideoFrameCallback(state.pipFrameCallbackId);
+  }
+  state.pipFrameCallbackId = 0;
   state.sourceVideo = null;
   if (state.canvasStream) state.canvasStream.getTracks().forEach(t => t.stop());
   state.canvasStream = null;
@@ -438,6 +470,8 @@ async function prepareCanvas(trigger = 'manual', autoOpenPiP = false) {
     const button = $('#hmp-canvas-pip');
     button.disabled = false;
     button.textContent = '重试准备';
+    // 页面上确实存在视频（只是尚未就绪）时才显示重试入口；完全没有视频的页面保持隐藏。
+    if (videos.length > 0) root.style.display = 'flex';
     logPrepare(attempt, startedAt, trigger, 'failed-no-source', { videoCount: videos.length, report });
     status('暂未找到已加载的视频。请确认直播已开始，然后点击重试。\n' + report);
     return;
@@ -448,7 +482,7 @@ async function prepareCanvas(trigger = 'manual', autoOpenPiP = false) {
     const downScale = Math.min(1, 1280 / video.videoWidth, 720 / video.videoHeight);
     canvas.width = Math.max(1, Math.round(video.videoWidth * downScale));
     canvas.height = Math.max(1, Math.round(video.videoHeight * downScale));
-    const ctx = canvas.getContext('2d', { alpha: false, desynchronized: true });
+    const ctx = canvas.getContext('2d', { alpha: false });
     const baseCanvas = document.createElement('canvas');
     baseCanvas.width = canvas.width;
     baseCanvas.height = canvas.height;
@@ -506,11 +540,14 @@ async function prepareCanvas(trigger = 'manual', autoOpenPiP = false) {
     let supportsVideoFrameCallback = typeof activeVideo.requestVideoFrameCallback === 'function';
     let videoFrameDirty = true;
     let lastVideoFrameAt = performance.now();
+    let lastMediaProgressAt = performance.now();
+    let lastObservedMediaTime = activeVideo.currentTime;
+    let lastPipFrameAt = performance.now();
+    let lastMonitorLogAt = 0;
     let lastDrawnMediaTime = activeVideo.currentTime;
     let sourceFrameCallbacks = 0;
     let lastSourceScanAt = 0;
     let sourceRebindCount = 0;
-
     const cancelSourceFrameCallback = () => {
       if (activeVideo && state.videoFrameCallbackId &&
           typeof activeVideo.cancelVideoFrameCallback === 'function') {
@@ -523,7 +560,7 @@ async function prepareCanvas(trigger = 'manual', autoOpenPiP = false) {
       if (!state.canvas || !activeVideo || !activeVideo.isConnected) return;
       sourceFrameCallbacks++;
       lastVideoFrameAt = performance.now();
-      videoFrameDirty = true;
+     videoFrameDirty = true;
       if (typeof activeVideo.requestVideoFrameCallback === 'function') {
         state.videoFrameCallbackId = activeVideo.requestVideoFrameCallback(onVideoFrame);
       }
@@ -536,7 +573,8 @@ async function prepareCanvas(trigger = 'manual', autoOpenPiP = false) {
     };
 
     const rebindSourceVideo = (nextVideo, reason) => {
-      if (!nextVideo || nextVideo === activeVideo || !nextVideo.isConnected ||
+      if (!nextVideo || nextVideo === activeVideo || isOwnCanvasVideo(nextVideo) ||
+          !nextVideo.isConnected ||
           nextVideo.videoWidth <= 0 || nextVideo.videoHeight <= 0) return false;
       cancelSourceFrameCallback();
       const previous = activeVideo;
@@ -545,6 +583,7 @@ async function prepareCanvas(trigger = 'manual', autoOpenPiP = false) {
       supportsVideoFrameCallback = typeof activeVideo.requestVideoFrameCallback === 'function';
       videoFrameDirty = true;
       lastVideoFrameAt = performance.now();
+      lastMediaProgressAt = lastVideoFrameAt;
       lastDrawnMediaTime = activeVideo.currentTime;
       sourceRebindCount++;
       try {
@@ -569,21 +608,50 @@ async function prepareCanvas(trigger = 'manual', autoOpenPiP = false) {
       if (now - lastSourceScanAt < 500) return;
       lastSourceScanAt = now;
       const disconnected = !activeVideo || !activeVideo.isConnected;
-      const frameStalled = now - lastVideoFrameAt > 1800;
-      const sourceNotAdvancing = activeVideo && activeVideo.paused;
-      if (!disconnected && !(frameStalled && sourceNotAdvancing)) return;
+      const currentTime = activeVideo && Number.isFinite(activeVideo.currentTime) ? activeVideo.currentTime : lastObservedMediaTime;
+      if (activeVideo && Math.abs(currentTime - lastObservedMediaTime) > 0.0005) {
+        lastObservedMediaTime = currentTime;
+        lastMediaProgressAt = now;
+      }
+      const mediaStalled = activeVideo && !activeVideo.paused && now - lastMediaProgressAt > 2500;
+      if (!disconnected && !mediaStalled) return;
       const candidate = chooseSource().video;
       if (candidate && candidate !== activeVideo && !candidate.paused) {
-        rebindSourceVideo(candidate, disconnected ? 'source-disconnected' : 'stalled-source-replaced');
+        rebindSourceVideo(candidate, disconnected ? 'source-disconnected' : 'playing-source-media-time-stalled');
+      } else if (mediaStalled && now - lastMonitorLogAt > 5000) {
+        lastMonitorLogAt = now;
+        console.warn('[HuyaMiniPlayer][source-stalled-no-alternate]', {
+          paused: activeVideo.paused, currentTime: activeVideo.currentTime,
+          readyState: activeVideo.readyState, lastFrameAgeMs: Math.round(now - lastVideoFrameAt)
+        });
       }
     };
-
     scheduleSourceFrameCallback();
+    const schedulePipFrameCallback = () => {
+      if (!state.canvas || !pipVideo.isConnected || typeof pipVideo.requestVideoFrameCallback !== 'function') return;
+      state.pipFrameCallbackId = pipVideo.requestVideoFrameCallback(() => {
+        lastPipFrameAt = performance.now();
+        schedulePipFrameCallback();
+      });
+    };
+    schedulePipFrameCallback();
+
 
     const draw = now => {
       if (!state.canvas) return;
       try {
         recoverSourceIfNeeded(now);
+        if (now - lastMonitorLogAt > 5000 && now - lastPipFrameAt > 2500 &&
+            activeVideo && !activeVideo.paused && now - lastMediaProgressAt < 1000) {
+          lastMonitorLogAt = now;
+          console.warn('[HuyaMiniPlayer][pip-output-stalled]', {
+            sourceCurrentTime: activeVideo.currentTime, pipCurrentTime: pipVideo.currentTime,
+            pipReadyState: pipVideo.readyState, pipFrameAgeMs: Math.round(now - lastPipFrameAt),
+            streamTrackState: state.canvasStream?.getVideoTracks()[0]?.readyState
+          });
+          // 浏览器偶尔会暂停这个几乎不可见的宿主 video；检测到暂停时主动恢复播放。
+          if (pipVideo.paused) pipVideo.play().catch(() => {});
+        }
         if (activeVideo && activeVideo.isConnected &&
             activeVideo.readyState >= 2 && activeVideo.videoWidth > 0) {
           // 源视频帧回调正常时按回调刷新；回调中断但媒体时间推进时启用兜底绘制。
@@ -595,14 +663,20 @@ async function prepareCanvas(trigger = 'manual', autoOpenPiP = false) {
             lastDrawnMediaTime = activeVideo.currentTime;
             if (mediaTimeAdvanced) lastVideoFrameAt = now;
           }
-          ctx.drawImage(baseCanvas, 0, 0, canvas.width, canvas.height);
-          drawDanmuOverlay(ctx, canvas, now);
         }
+        ctx.drawImage(baseCanvas, 0, 0, canvas.width, canvas.height);
+        drawDanmuOverlay(ctx, canvas, now);
         // 即使旧 video 被移除，也继续运行监测；新 video 出现后可重新绑定。
         state.raf = requestAnimationFrame(draw);
       } catch (e) {
         status('Canvas 持续绘制失败：' + e.name + ' / ' + e.message);
         stopCanvas();
+        const button = $('#hmp-canvas-pip');
+        if (button) {
+          button.disabled = false;
+          button.textContent = '重试准备';
+        }
+        root.style.display = 'flex';
       }
     };
     state.raf = requestAnimationFrame(draw);
@@ -625,6 +699,7 @@ async function prepareCanvas(trigger = 'manual', autoOpenPiP = false) {
       pip: { currentTime: pipVideo.currentTime, paused: pipVideo.paused, readyState: pipVideo.readyState },
       track: { readyState: videoTrack.readyState, settings: videoTrack.getSettings?.() || {} }
     });
+    root.style.display = 'flex';
     $('#hmp-canvas-pip').disabled = false;
     $('#hmp-canvas-pip').textContent = '小窗播放';
     if (autoOpenPiP) {
@@ -676,14 +751,34 @@ async function prepareCanvas(trigger = 'manual', autoOpenPiP = false) {
     const button = $('#hmp-canvas-pip');
     button.disabled = false;
     button.textContent = '重试准备';
+    root.style.display = 'flex';
     status('小窗准备失败：' + e.name + ' / ' + e.message);
     console.error('[HuyaMiniPlayer] Canvas preparation failed:', e);
   }
 }
 
-window.setTimeout(() => {
-  if (!state.canvas && !state.canvasVideo) prepareCanvas('automatic-1200ms');
-}, 1200);
+// 虎牙播放器晚于脚本注入创建 video，只在固定时间点准备一次会在页面稍慢时直接失败，
+// 而失败后按钮又被隐藏，用户看到的就是“脚本没反应”。改为等可用视频出现后再预热。
+const AUTO_START_DELAY_MS = 1200;
+const AUTO_START_POLL_MS = 500;
+const AUTO_START_MAX_WAIT_MS = 20000;
+
+function startAutomaticPrepare() {
+  const startedAt = performance.now();
+  const tick = () => {
+    if (state.canvas || state.canvasVideo) return;
+    const elapsed = performance.now() - startedAt;
+    const { video, videos } = chooseSource();
+    if (video || (videos.length > 0 && elapsed >= AUTO_START_MAX_WAIT_MS)) {
+      prepareCanvas('automatic-startup');
+      return;
+    }
+    if (elapsed >= AUTO_START_MAX_WAIT_MS) return;
+    window.setTimeout(tick, AUTO_START_POLL_MS);
+  };
+  window.setTimeout(tick, AUTO_START_DELAY_MS);
+}
+startAutomaticPrepare();
 
 // PiP 请求必须直接发生在用户点击回调中，不能放到异步预热之后。
 $('#hmp-canvas-pip').addEventListener('click', () => {
